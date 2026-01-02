@@ -1,0 +1,2 @@
+class SeatAlreadyLockedException(Exception):
+    pass
