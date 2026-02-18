@@ -10,6 +10,7 @@ from app.core.exceptions import InsufficientBalanceError, WalletError, WalletNot
 from app.models.transaction import Transaction, TransactionStatus, TransactionType
 from app.models.ledger_entry import EntryType, LedgerEntry
 from app.services.idempotency_service import check_idempotency, save_idempotency, compute_request_hash
+from app.services.balance_service import optimistic_credit, optimistic_debit, optimistic_debit_system_account, optimistic_credit_system_account
 
 
 class WalletCrudService:
@@ -59,7 +60,7 @@ class WalletCrudService:
         try:
             async with db_session.begin():
                 # Step 1: Check idempotency FIRST (before locking -- it's just a read)
-                request_hash = compute_request_hash(data)
+                request_hash = compute_request_hash(data.model_dump())
                 cached_response = await check_idempotency(idempotency_key=idempotency_key, request_hash=request_hash, db_session=db_session)
                 if cached_response:
                     return cached_response
@@ -75,7 +76,7 @@ class WalletCrudService:
                  #  (the money comes from somewhere)
                  #  For now, you can query it or hardcode a known system account ID
 
-                get_system_account_result = await db_session.execute(select(WalletAccount).where(WalletAccount.account_type == AccountType.SYSTEM))
+                get_system_account_result = await db_session.execute(select(WalletAccount).where(WalletAccount.account_type == AccountType.SYSTEM).with_for_update())
                 system_account = get_system_account_result.scalar_one_or_none()
                 if system_account is None:
                     raise WalletNotFoundError()
@@ -127,7 +128,7 @@ class WalletCrudService:
                 #     request_hash="...",  # hash of the request
                 #     request_json=response,
                 # ))
-                await save_idempotency(idempotency_key=idempotency_key, request_hash=request_hash, request_data=data, db_session=db_session)
+                await save_idempotency(idempotency_key=idempotency_key, request_hash=request_hash, request_json=response, db_session=db_session)
             return response
         except Exception as e:
             logging.error(f"Failed to credit wallet: {e}", exc_info=True)
@@ -137,10 +138,10 @@ class WalletCrudService:
         try:
             async with db_session.begin():
                 # check idempotency
-                get_idempotency_result = await db_session.execute(select(IdempotencyKey).where(IdempotencyKey.key == idempotency_key))
-                result = get_idempotency_result.scalar_one_or_none()
-                if result:
-                    return result.request_json
+                request_hash = compute_request_hash(data.model_dump())
+                cached_response = await check_idempotency(idempotency_key=idempotency_key, request_hash=request_hash, db_session=db_session)
+                if cached_response:
+                    return cached_response
                 # lock the wallet
                 get_wallet_result = await db_session.execute(select(WalletAccount).where(WalletAccount.id == wallet_id).with_for_update())
                 wallet = get_wallet_result.scalar_one_or_none()
@@ -195,11 +196,7 @@ class WalletCrudService:
                 }
 
                 # create idemoptency record
-                db_session.add(IdempotencyKey(
-                    key=idempotency_key,
-                    request_hash="...",  # hash of the request
-                    request_json=response,
-                ))
+                await save_idempotency(idempotency_key=idempotency_key, request_hash=request_hash, request_json=response, db_session=db_session)
 
             return response
 
@@ -213,7 +210,7 @@ class WalletCrudService:
         try:
             async with db_session.begin():
                 # check for idempotency
-                request_hash = compute_request_hash(data)
+                request_hash = compute_request_hash(data.model_dump())
                 cached_response = await check_idempotency(idempotency_key=idempotency_key, request_hash=request_hash, db_session=db_session)
                 if cached_response:
                     return cached_response
@@ -292,7 +289,7 @@ class WalletCrudService:
                     "status": TransactionStatus.COMPLETED,
                 }
                 # create the idempotency key
-                await save_idempotency(idempotency_key=idempotency_key, request_hash=request_hash, request_data=data, db_session=db_session)
+                await save_idempotency(idempotency_key=idempotency_key, request_hash=request_hash, request_json=response, db_session=db_session)
             return response
 
         except Exception as e:
@@ -300,6 +297,113 @@ class WalletCrudService:
             if isinstance(e, WalletError):
                 raise e
             raise WalletError("failed to transfer wallet")
+
+    async def credit_wallet_optimistic(self, walletId: UUID, idempotency_key: str, data: CreditRequest, db_session: AsyncSession):
+        try:
+            async with db_session.begin():
+                # check idempency
+                request_hash = compute_request_hash(data.model_dump())
+                cached_response = await check_idempotency(idempotency_key=idempotency_key, request_hash=request_hash, db_session=db_session)
+                if cached_response:
+                    return cached_response
+                # credit the wallet
+                (new_balance, new_version) = await optimistic_credit(wallet_id=walletId, amount=data.amount, max_retries=3, db_session=db_session)
+                system_account_result = await optimistic_debit_system_account(amount=data.amount, max_retries=3, db_session=db_session)
+                # create the transaction
+                transaction = Transaction(
+                    source_account_id=system_account_result["system_account_id"],
+                    destination_account_id=walletId,
+                    transaction_type=TransactionType.CREDIT,
+                    idempotency_key=idempotency_key,
+                    amount=data.amount,
+                    status=TransactionStatus.COMPLETED,
+                )
+                db_session.add(transaction)
+                await db_session.flush()
+                # create the ledger entries
+                debit_ledger_entry = LedgerEntry(
+                    account_id=system_account_result["system_account_id"],
+                    amount=data.amount,
+                    transaction_id=transaction.id,
+                    running_balance=system_account_result["new_balance"],
+                    entry_type=EntryType.DEBIT,
+                )
+                credit_ledger_entry = LedgerEntry(
+                    account_id=walletId,
+                    amount=data.amount,
+                    transaction_id=transaction.id,
+                    running_balance=new_balance,
+                    entry_type=EntryType.CREDIT,
+                )
+                db_session.add_all([debit_ledger_entry, credit_ledger_entry])
+
+                response = {
+                    "transaction_id": str(transaction.id),
+                    "amount": data.amount,
+                    "status": TransactionStatus.COMPLETED,
+                }
+                # create the idempotency key
+                await save_idempotency(idempotency_key=idempotency_key, request_hash=request_hash, request_json=response, db_session=db_session)
+            return response
+        except WalletError as e:
+            raise e
+        except Exception as e:
+            logging.error(
+                f"failed to credit wallet optimistic: {e}", exc_info=True)
+            raise WalletError("failed to credit wallet optimistic")
+
+    async def debit_wallet_optimistic(self, wallet_id: UUID, idempotency_key: str, data: DebitRequest, db_session: AsyncSession):
+        try:
+            async with db_session.begin():
+                # check idempency
+                request_hash = compute_request_hash(data.model_dump())
+                cached_response = await check_idempotency(idempotency_key=idempotency_key, request_hash=request_hash, db_session=db_session)
+                if cached_response:
+                    return cached_response
+                # debit the wallet
+                (new_balance, new_version) = await optimistic_debit(wallet_id=wallet_id, amount=data.amount, max_retries=3, db_session=db_session)
+                system_account_result = await optimistic_credit_system_account(amount=data.amount, max_retries=3, db_session=db_session)
+                # create the transaction
+                transaction = Transaction(
+                    source_account_id=wallet_id,
+                    destination_account_id=system_account_result["system_account_id"],
+                    transaction_type=TransactionType.DEBIT,
+                    idempotency_key=idempotency_key,
+                    amount=data.amount,
+                    status=TransactionStatus.COMPLETED,
+                )
+                db_session.add(transaction)
+                await db_session.flush()
+                # create the ledger entries
+                debit_ledger_entry = LedgerEntry(
+                    account_id=wallet_id,
+                    amount=data.amount,
+                    transaction_id=transaction.id,
+                    running_balance=new_balance,
+                    entry_type=EntryType.DEBIT,
+                )
+                credit_ledger_entry = LedgerEntry(
+                    account_id=system_account_result["system_account_id"],
+                    amount=data.amount,
+                    transaction_id=transaction.id,
+                    running_balance=system_account_result["new_balance"],
+                    entry_type=EntryType.CREDIT,
+                )
+                db_session.add_all([debit_ledger_entry, credit_ledger_entry])
+                response = {
+                    "transaction_id": str(transaction.id),
+                    "amount": data.amount,
+                    "status": TransactionStatus.COMPLETED,
+                }
+                # create the idempotency key
+                await save_idempotency(idempotency_key=idempotency_key, request_hash=request_hash, request_json=response, db_session=db_session)
+            return response
+        except WalletError as e:
+            raise e
+        except Exception as e:
+            logging.error(
+                f"failed to debit wallet optimistic: {e}", exc_info=True)
+            raise WalletError("failed to debit wallet optimistic")
 
 
 wallet_crud_service = WalletCrudService()
