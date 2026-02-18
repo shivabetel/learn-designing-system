@@ -12,6 +12,7 @@ The system uses **double-entry bookkeeping**, the same accounting principle used
 - **SQLAlchemy 2.0** -- async ORM with `asyncpg` driver
 - **PostgreSQL** -- primary database
 - **Pydantic v2** -- request/response validation
+- **Alembic** -- database migration management (async mode with `greenlet`)
 
 ---
 
@@ -357,13 +358,120 @@ wallet-ledger/
     services/
       idempotency_service.py    # check_idempotency, save_idempotency, compute_request_hash
       balance_service.py        # optimistic_credit, optimistic_debit, optimistic_*_system_account
-  main.py                       # Uvicorn entry point
-  pyproject.toml                # Dependencies
+  migrations/
+    env.py                       # Alembic environment -- connects to DB, imports models
+    script.py.mako               # Template for new migration files
+    versions/                    # Auto-generated migration scripts live here
+      xxxx_initial_schema.py
+  alembic.ini                    # Alembic config (DB URL, migration path, logging)
+  main.py                        # Uvicorn entry point
+  pyproject.toml                 # Dependencies
 ```
 
 ---
 
-## 8. Key Design Decisions
+## 8. Database Migrations (Alembic)
+
+### Why Not `create_all()`?
+
+Initially, tables were created at startup using `Base.metadata.create_all()`. This works for bootstrapping but is dangerous beyond early development:
+
+- `create_all()` only creates tables that **don't exist yet**. It cannot alter existing tables (add columns, change types, add indexes).
+- If you add a `phone_number` column to `WalletAccount` in Python, the existing database table stays unchanged -- no error, no warning, just silent inconsistency.
+- No history of what changed, when, or why. No way to roll back.
+
+Alembic solves all of this with **version-controlled migration scripts**.
+
+### How Alembic Works
+
+```
+SQLAlchemy Models  ──autogenerate──>  Migration File  ──upgrade──>  PostgreSQL
+   (Python code)                     (upgrade/downgrade)            (actual tables)
+```
+
+1. You change a model in Python (e.g., add a column)
+2. `alembic revision --autogenerate` compares your models against the live database and generates a migration file with the diff
+3. `alembic upgrade head` executes the migration's `upgrade()` function against the database
+4. Alembic records the revision ID in an `alembic_version` table so it knows what has been applied
+
+Each migration file has two functions:
+- `upgrade()` -- apply the change (e.g., `ALTER TABLE ADD COLUMN`)
+- `downgrade()` -- reverse the change (e.g., `ALTER TABLE DROP COLUMN`)
+
+### Key Files
+
+**`alembic.ini`** -- Top-level config. The most important setting is `sqlalchemy.url`, but we leave it blank and provide the URL from Python code instead (so it reads from our `settings.DATABASE_URL`, keeping the single source of truth).
+
+**`migrations/env.py`** -- The script Alembic runs to connect to the database and execute migrations. Our customizations:
+
+```python
+from app.db.base import Base
+from app.models import WalletAccount, LedgerEntry, IdempotencyKey, Transaction
+from app.core.config import settings
+
+target_metadata = Base.metadata   # Alembic compares this against the live DB
+
+def get_url():
+    return settings.DATABASE_URL  # postgresql+asyncpg://...
+```
+
+`target_metadata` tells Alembic what the schema **should** look like. `get_url()` tells it which database to compare against. The `--autogenerate` flag diffs the two and produces migration scripts.
+
+**`migrations/versions/`** -- Where migration files live. Each file is named `{revision_id}_{slug}.py` and contains an `upgrade()` and `downgrade()` function. These files are committed to git.
+
+### Setup Notes (Async)
+
+Alembic was designed for synchronous SQLAlchemy. For async (`asyncpg`), two extra things are needed:
+
+1. **`alembic init -t async migrations`** -- the `-t async` flag generates an `env.py` that uses `async_engine_from_config` and `asyncio.run()` instead of synchronous engine creation.
+
+2. **`greenlet` package** -- SQLAlchemy's `connection.run_sync()` (used in `env.py` to bridge async engine with sync migration runner) requires `greenlet` under the hood. Without it: `ValueError: the greenlet library is required`.
+
+### Common Commands
+
+```bash
+# Generate a migration by comparing models vs database
+uv run alembic revision --autogenerate -m "description of change"
+
+# Apply all pending migrations
+uv run alembic upgrade head
+
+# Roll back the last migration
+uv run alembic downgrade -1
+
+# See current database revision
+uv run alembic current
+
+# See migration history
+uv run alembic history
+
+# See what SQL a migration would run (without executing)
+uv run alembic upgrade head --sql
+```
+
+### Day-to-Day Workflow
+
+```
+1. Edit a model         (e.g., add `phone: str` to WalletAccount)
+2. Generate migration   (alembic revision --autogenerate -m "add phone to wallet")
+3. Review the file      (ALWAYS review -- autogenerate can miss things or get them wrong)
+4. Apply                (alembic upgrade head)
+5. Commit to git        (migration file + model change together)
+```
+
+### Gotchas Learned
+
+| Issue | What Happened | Why |
+|-------|---------------|-----|
+| `No module named 'psycopg2'` | `alembic.ini` had `postgresql://` as the URL | `postgresql://` uses psycopg2 (sync driver). Need `postgresql+asyncpg://` for our async setup. Fix: provide URL from `get_url()` instead of ini file |
+| `No module named 'greenlet'` | Ran `alembic revision --autogenerate` | Alembic's async `env.py` uses `run_sync()` which needs `greenlet`. Fix: `uv add greenlet` |
+| `Target database is not up to date` | Ran `revision --autogenerate` twice | A pending migration exists that hasn't been applied. Fix: run `alembic upgrade head` first, then generate new migrations |
+| Empty migration (`pass`) | Ran autogenerate with tables already created by `create_all()` | Alembic compared models against existing tables, found no diff. Fix: drop tables first, then generate, or use `alembic stamp head` to adopt existing schema |
+| `target_metadata = None` | Autogenerate produced empty migration | The auto-generated `env.py` template has `target_metadata = None`. Must set it to `Base.metadata` so Alembic knows the target schema |
+
+---
+
+## 9. Key Design Decisions
 
 | Decision | Rationale |
 |----------|-----------|
@@ -375,3 +483,5 @@ wallet-ledger/
 | Idempotency key as separate table | Decouples retry logic from transaction logic. Response caching enables safe replays |
 | SYSTEM account for money in/out | Ensures double-entry books always balance. `SUM(all accounts) = 0` is the invariant |
 | `async with session.begin()` | Single transaction boundary. Auto-commit on success, auto-rollback on failure |
+| Alembic over `create_all()` | Version-controlled migrations that can alter tables, track history, and roll back. `create_all()` can only create new tables |
+| DB URL from Python, not ini | `alembic.ini` URL left blank; `env.py` reads from `settings.DATABASE_URL`. Single source of truth for connection config |

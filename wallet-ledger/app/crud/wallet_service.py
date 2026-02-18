@@ -130,9 +130,11 @@ class WalletCrudService:
                 # ))
                 await save_idempotency(idempotency_key=idempotency_key, request_hash=request_hash, request_json=response, db_session=db_session)
             return response
+        except WalletError as e:
+            raise e
         except Exception as e:
             logging.error(f"Failed to credit wallet: {e}", exc_info=True)
-            raise WalletError(f"Failed to credit wallet")
+            raise WalletError("Failed to credit wallet")
 
     async def debit_wallet(self, wallet_id: UUID, idempotency_key: str, data: DebitRequest, db_session: AsyncSession):
         try:

@@ -44,6 +44,6 @@ async def debit_wallet(wallet_id: str, request: DebitRequest, idempotency_key: s
 
 
 @router.post("/transfer")
-async def transfer_wallet(request: TransferRequest, idempotency_key: str = Header(..., alias="Idemopotency-Key"), db_session: AsyncSession = Depends(get_db_session)):
+async def transfer_wallet(request: TransferRequest, idempotency_key: str = Header(..., alias="Idempotency-Key"), db_session: AsyncSession = Depends(get_db_session)):
     response = await wallet_crud_service.transfer_wallet(idempotency_key=idempotency_key, data=request, db_session=db_session)
     return response
